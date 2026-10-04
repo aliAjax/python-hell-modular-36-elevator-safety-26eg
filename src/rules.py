@@ -63,9 +63,27 @@ def _validate_maintenance(data, lookup):
         raise ValidationError("part_serial is required for component replacement")
 
 
+DEFAULT_JOB_LEVEL = 2
+MAX_JOB_LEVEL = 4
+UNFINISHED_JOB_STATUSES = ("queued", "dispatched", "on_site")
+
+
+def _job_level(data):
+    level = data.get("level", DEFAULT_JOB_LEVEL)
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        raise ValidationError("level must be an integer between 0 and %s" % MAX_JOB_LEVEL)
+    if level < 0 or level > MAX_JOB_LEVEL:
+        raise ValidationError("level must be an integer between 0 and %s" % MAX_JOB_LEVEL)
+    return level
+
+
 def _validate_alarm(data, lookup):
     if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
         raise ValidationError("alarm requires equipment")
+    if data.get("level") is not None:
+        _job_level(data)
     for alarm in _all(lookup, "alarm"):
         if (
             alarm["data"].get("equipment_id") == data.get("equipment_id")
@@ -77,12 +95,22 @@ def _validate_alarm(data, lookup):
 
 def _validate_rescue(data, lookup):
     alarm = _find_one(lookup, "alarm", "id", data.get("alarm_id"))
-    if not alarm or alarm["status"] == "closed":
+    if not alarm or alarm["status"] in ("closed", "false_alarm"):
         raise ValidationError("rescue_job requires an active alarm")
+    data["level"] = _job_level(data) if data.get("level") is not None else int(alarm["data"].get("level", DEFAULT_JOB_LEVEL))
     key = data.get("dedupe_key")
-    for job in _all(lookup, "rescue_job"):
-        if job["data"].get("dedupe_key") == key and job["status"] not in ("completed", "aborted"):
-            raise ConflictError("active rescue job already exists for dedupe_key")
+    if key:
+        for job in _all(lookup, "rescue_job"):
+            if job["data"].get("dedupe_key") == key and job["status"] not in ("completed", "aborted"):
+                raise ConflictError("active rescue job already exists for dedupe_key")
+
+
+def _validate_worker(data, lookup):
+    worker_no = str(data.get("worker_no", "")).strip()
+    if not worker_no:
+        raise ValidationError("worker_no is required")
+    if _find_one(lookup, "rescue_worker", "worker_no", worker_no):
+        raise ConflictError("worker_no already exists: " + worker_no)
 
 
 def _validate_remediation(data, lookup):
@@ -130,18 +158,18 @@ class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "rescue_workers": "rescue_worker",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
-        "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "alarm": "received", "rescue_job": "queued", "remediation": "open",
+        "permit": "blocked", "rescue_worker": "active",
     }
     TRANSITIONS = {
         "equipment": {
             "suspend": (("in_service",), "suspended"),
             "out_of_service": (("in_service", "suspended"), "out_of_service"),
-            "return_to_service": (("suspended",), "in_service"),
+            "return_to_service": (("suspended", "out_of_service"), "in_service"),
         },
         "inspection": {
             "pass": (("scheduled",), "passed"),
@@ -159,9 +187,16 @@ class RuleEngine:
             "close": (("resolved",), "closed"),
         },
         "rescue_job": {
+            "assign": (("queued", "dispatched"), "dispatched"),
+            "queue": (("queued", "dispatched"), "queued"),
             "arrive": (("dispatched",), "on_site"),
             "complete": (("on_site",), "completed"),
-            "abort": (("dispatched", "on_site"), "aborted"),
+            "abort": (("queued", "dispatched", "on_site"), "aborted"),
+        },
+        "rescue_worker": {
+            "deactivate": (("active",), "inactive"),
+            "end_shift": (("active",), "off_shift"),
+            "activate": (("inactive", "off_shift"), "active"),
         },
         "remediation": {
             "submit_evidence": (("open",), "evidence_submitted"),
@@ -181,9 +216,10 @@ class RuleEngine:
         "inspection": ("equipment_id", "scheduled_at", "cycle_days"),
         "maintenance": ("equipment_id", "work_type", "planned_at"),
         "alarm": ("equipment_id", "code", "occurred_at"),
-        "rescue_job": ("alarm_id", "dedupe_key", "team"),
+        "rescue_job": ("alarm_id",),
         "remediation": ("issue", "owner", "due_at"),
         "permit": ("equipment_id", "purpose", "requested_by"),
+        "rescue_worker": ("worker_no", "name"),
     }
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
@@ -193,6 +229,8 @@ class RuleEngine:
         ("remediation", "submit_evidence"): ("evidence",),
         ("alarm", "resolve"): ("resolution",),
         ("permit", "revoke"): ("reason",),
+        ("rescue_worker", "deactivate"): ("reason",),
+        ("rescue_worker", "end_shift"): ("reason",),
     }
     CREATE_ROLES = {
         "equipment": ("admin", "inspector"),
@@ -202,6 +240,7 @@ class RuleEngine:
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
+        "rescue_worker": ("admin", "dispatcher"),
     }
     ROLE_ACTIONS = {
         "suspend": ("admin", "inspector"),
@@ -216,8 +255,13 @@ class RuleEngine:
         "mark_false": ("admin", "dispatcher", "inspector"),
         "resolve": ("admin", "dispatcher"),
         "close": ("admin", "dispatcher", "inspector"),
-        "arrive": ("admin", "dispatcher"),
+        "assign": ("admin", "dispatcher"),
+        "queue": ("admin", "dispatcher"),
+        "arrive": ("admin", "dispatcher", "maintenance"),
         "abort": ("admin", "dispatcher"),
+        "deactivate": ("admin", "dispatcher"),
+        "end_shift": ("admin", "dispatcher"),
+        "activate": ("admin", "dispatcher"),
         "submit_evidence": ("admin", "maintenance", "inspector"),
         "verify": ("admin", "inspector"),
         "reject": ("admin", "inspector"),
@@ -234,6 +278,7 @@ class RuleEngine:
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
         "remediation": lambda a, d, l: _validate_remediation(d, l),
         "permit": lambda a, d, l: _validate_permit(d, l),
+        "rescue_worker": lambda a, d, l: _validate_worker(d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("permit", "grant"): _grant_permit,
@@ -278,3 +323,90 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def plan_assignments(self, workers, jobs, released_worker_ids=None, full_recompute=False, recompute_ids=None):
+        """Compute the dispatch ledger for unfinished rescue jobs.
+
+        Rules:
+        - every active worker carries at most one unfinished job;
+        - jobs wait by (level desc, seq asc), i.e. higher level jumps to the
+          front while displaced jobs keep their original order;
+        - on_site jobs always keep their worker (on-site missions continue);
+        - released_worker_ids lose their jobs (worker disabled / shift end),
+          on_site orphans still get first dibs at a free worker;
+        - full_recompute / recompute_ids re-matches not-started jobs (e.g.
+          equipment state change); jobs outside recompute_ids stay pinned.
+
+        Returns a list of movements: {job_id, worker_id or None, status}.
+        """
+        released = set(released_worker_ids or ())
+        # When a crew is stopped, unstarted dispatches are reshuffled together
+        # with the released jobs so an on-site orphan can inherit a crew;
+        # ordinary incremental scheduling never steals occupied workers.
+        release_mode = bool(released)
+        # No registered workers at all: keep the legacy team-based mode untouched.
+        if not workers:
+            return []
+        recompute = set(recompute_ids or ())
+        if full_recompute:
+            recompute = {j["id"] for j in jobs}
+        active_workers = [w for w in workers if w["status"] == "active"]
+        active_ids = {w["id"] for w in active_workers}
+        pending = [j for j in jobs if j["status"] in UNFINISHED_JOB_STATUSES]
+
+        # 1. Current bindings that stay pinned. On-site tasks on a working crew
+        # always continue; dispatched tasks stay unless their slot is released
+        # (release reshuffles so the on-site orphan can inherit a crew) or
+        # they are inside a recompute scope.
+        occupied = set()
+        loose = []
+        for job in pending:
+            worker_id = job["data"].get("assignee_id")
+            keep = False
+            if job["status"] == "on_site" and worker_id in active_ids and worker_id not in released:
+                keep = True
+            elif (
+                not release_mode
+                and job["id"] not in recompute
+                and worker_id
+                and worker_id in active_ids
+            ):
+                keep = True
+            if keep:
+                occupied.add(worker_id)
+            else:
+                loose.append(job)
+
+        # 2. Free workers, in stable worker order.
+        free_workers = [w["id"] for w in active_workers if w["id"] not in occupied and w["id"] not in released]
+
+        # 3. Waiting order. On-site orphans (crew just stopped) jump ahead so
+        # the rescue continues; otherwise higher level first, original queue
+        # order otherwise.
+        def job_key(job):
+            level = int(job["data"].get("level", DEFAULT_JOB_LEVEL))
+            seq = int(job["data"].get("seq", 0))
+            on_site_bonus = 1 if job["status"] == "on_site" else 0
+            return (-on_site_bonus, -level, seq)
+
+        loose.sort(key=job_key)
+
+        movements = []
+        free_index = 0
+        for job in loose:
+            if free_index < len(free_workers):
+                worker_id = free_workers[free_index]
+                free_index += 1
+                target_status = "on_site" if job["status"] == "on_site" else "dispatched"
+                if job["data"].get("assignee_id") != worker_id or job["status"] != target_status:
+                    movements.append({"job_id": job["id"], "worker_id": worker_id, "status": target_status})
+            else:
+                if job["status"] == "on_site":
+                    # No one free, but an on-site mission cannot regress to
+                    # queued: it stays on_site without an assignee until a crew
+                    # comes back, keeping the recorded arrival time.
+                    if job["data"].get("assignee_id") is not None:
+                        movements.append({"job_id": job["id"], "worker_id": None, "status": "on_site"})
+                elif job["data"].get("assignee_id") is not None or job["status"] != "queued":
+                    movements.append({"job_id": job["id"], "worker_id": None, "status": "queued"})
+        return movements

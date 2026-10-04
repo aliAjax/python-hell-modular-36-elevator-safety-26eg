@@ -99,7 +99,7 @@ class SQLiteRepository:
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM entities" + where + " ORDER BY created_at, id", params
+                "SELECT * FROM entities" + where + " ORDER BY rowid, id", params
             ).fetchall()
         return [self._entity_from_row(row) for row in rows]
 
@@ -107,11 +107,17 @@ class SQLiteRepository:
         entities = self.list_entities(kind=kind)
         if field == "*":
             return entities
-        return [
-            entity
-            for entity in entities
-            if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
-        ]
+
+        def read(entity, name):
+            if "." in name:
+                head, tail = name.split(".", 1)
+                nested = entity.get(head)
+                return nested.get(tail) if isinstance(nested, dict) else None
+            if name == "id":
+                return entity["id"]
+            return entity["data"].get(name)
+
+        return [entity for entity in entities if read(entity, field) == value]
 
     def update_entity(self, entity_id, expected_version, status, data):
         now = utcnow()
