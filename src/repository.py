@@ -80,6 +80,68 @@ class SQLiteRepository:
             )
         return self.get_entity(entity_id)
 
+    def create_rescue_job(self, entity_id, data, actor_id):
+        """Create a rescue job atomically.
+
+        Re-checks that the alarm has no active rescue job (so a second dispatcher
+        sees the current owner), then auto-assigns to a free on-duty rescuer or
+        queues the job. When no rescuer pool exists yet, falls back to the
+        requested team (legacy mode).
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT id, data, status FROM entities WHERE kind = 'rescue_job'"
+            ).fetchall()
+            for row in rows:
+                if row["status"] in ("completed", "aborted"):
+                    continue
+                current = json.loads(row["data"])
+                if current.get("alarm_id") == data.get("alarm_id"):
+                    owner = current.get("team") or "unassigned"
+                    raise ConflictError(
+                        "alarm already dispatched, current owner: " + str(owner)
+                    )
+            rescuers = connection.execute(
+                "SELECT data FROM entities WHERE kind = 'rescuer'"
+            ).fetchall()
+            if not rescuers:
+                status = "dispatched"
+            else:
+                busy = {
+                    json.loads(row["data"]).get("team")
+                    for row in rows
+                    if row["status"] in ("dispatched", "on_site")
+                }
+                free = [
+                    json.loads(row["data"]).get("name")
+                    for row in rescuers
+                    if json.loads(row["data"]).get("name") not in busy
+                ]
+                preferred = data.get("team")
+                chosen = preferred if preferred in free else (free[0] if free else None)
+                if chosen:
+                    data = dict(data)
+                    data["team"] = chosen
+                    status = "dispatched"
+                else:
+                    status = "queued"
+            payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'rescue_job', ?, 1, ?, ?, ?, ?)",
+                (entity_id, status, payload, actor_id, now, now),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(entity_id)
+
     def get_entity(self, entity_id):
         with self._connect() as connection:
             row = connection.execute(

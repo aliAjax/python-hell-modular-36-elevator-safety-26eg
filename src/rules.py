@@ -66,6 +66,7 @@ def _validate_maintenance(data, lookup):
 def _validate_alarm(data, lookup):
     if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
         raise ValidationError("alarm requires equipment")
+    _validate_alarm_level(data, lookup)
     for alarm in _all(lookup, "alarm"):
         if (
             alarm["data"].get("equipment_id") == data.get("equipment_id")
@@ -83,6 +84,36 @@ def _validate_rescue(data, lookup):
     for job in _all(lookup, "rescue_job"):
         if job["data"].get("dedupe_key") == key and job["status"] not in ("completed", "aborted"):
             raise ConflictError("active rescue job already exists for dedupe_key")
+    alarm_id = data.get("alarm_id")
+    for job in _all(lookup, "rescue_job"):
+        if job["data"].get("alarm_id") == alarm_id and job["status"] not in ("completed", "aborted"):
+            owner = job["data"].get("team") or "unassigned"
+            raise ConflictError("alarm already dispatched, current owner: " + str(owner))
+
+
+def _validate_rescuer(data, lookup):
+    name = str(data.get("name", "")).strip()
+    if not name:
+        raise ValidationError("rescuer name is required")
+    for rescuer in _all(lookup, "rescuer"):
+        if rescuer["data"].get("name") == name:
+            raise ConflictError("rescuer name already exists: " + name)
+
+
+def _validate_alarm_level(data, lookup):
+    level = data.get("level")
+    if level is None or level == "":
+        return
+    try:
+        number = int(level)
+    except (TypeError, ValueError):
+        raise ValidationError("alarm level must be an integer 1-5")
+    if number < 1 or number > 5:
+        raise ValidationError("alarm level must be between 1 and 5")
+
+
+def _record_arrival(actor, entity, data, lookup):
+    return {"arrived_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
 
 
 def _validate_remediation(data, lookup):
@@ -129,13 +160,13 @@ def _complete_rescue(actor, entity, data, lookup):
 class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
-        "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "alarms": "alarm", "rescue_jobs": "rescue_job", "rescuers": "rescuer",
+        "remediations": "remediation", "permits": "permit",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
-        "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "alarm": "received", "rescue_job": "dispatched", "rescuer": "on_duty",
+        "remediation": "open", "permit": "blocked",
     }
     TRANSITIONS = {
         "equipment": {
@@ -161,7 +192,13 @@ class RuleEngine:
         "rescue_job": {
             "arrive": (("dispatched",), "on_site"),
             "complete": (("on_site",), "completed"),
-            "abort": (("dispatched", "on_site"), "aborted"),
+            "abort": (("dispatched", "on_site", "queued"), "aborted"),
+        },
+        "rescuer": {
+            "activate": (("off_duty",), "on_duty"),
+            "deactivate": (("on_duty",), "off_duty"),
+            "go_on_shift": (("off_duty",), "on_duty"),
+            "go_off_shift": (("on_duty",), "off_duty"),
         },
         "remediation": {
             "submit_evidence": (("open",), "evidence_submitted"),
@@ -182,6 +219,7 @@ class RuleEngine:
         "maintenance": ("equipment_id", "work_type", "planned_at"),
         "alarm": ("equipment_id", "code", "occurred_at"),
         "rescue_job": ("alarm_id", "dedupe_key", "team"),
+        "rescuer": ("name",),
         "remediation": ("issue", "owner", "due_at"),
         "permit": ("equipment_id", "purpose", "requested_by"),
     }
@@ -200,6 +238,7 @@ class RuleEngine:
         "maintenance": ("admin", "maintenance"),
         "alarm": ("admin", "dispatcher", "inspector"),
         "rescue_job": ("admin", "dispatcher"),
+        "rescuer": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
     }
@@ -218,6 +257,10 @@ class RuleEngine:
         "close": ("admin", "dispatcher", "inspector"),
         "arrive": ("admin", "dispatcher"),
         "abort": ("admin", "dispatcher"),
+        "activate": ("admin", "dispatcher"),
+        "deactivate": ("admin", "dispatcher"),
+        "go_on_shift": ("admin", "dispatcher"),
+        "go_off_shift": ("admin", "dispatcher"),
         "submit_evidence": ("admin", "maintenance", "inspector"),
         "verify": ("admin", "inspector"),
         "reject": ("admin", "inspector"),
@@ -232,6 +275,7 @@ class RuleEngine:
         "maintenance": lambda a, d, l: _validate_maintenance(d, l),
         "alarm": lambda a, d, l: _validate_alarm(d, l),
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
+        "rescuer": lambda a, d, l: _validate_rescuer(d, l),
         "remediation": lambda a, d, l: _validate_remediation(d, l),
         "permit": lambda a, d, l: _validate_permit(d, l),
     }
@@ -239,6 +283,7 @@ class RuleEngine:
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("rescue_job", "arrive"): _record_arrival,
     }
 
     def normalize_kind(self, kind):
